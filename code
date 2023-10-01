@@ -1,0 +1,198 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC721/extensions/ERC721Enumerable.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Counters.sol";
+
+// Escrow contract interface
+interface EscrowInterface {
+    function proveOwnership(uint256 tokenId) external;
+    function claimPayment(uint256 tokenId) external;
+}
+
+contract SolarPanelNFT is ERC721Enumerable, Ownable, ReentrancyGuard {
+    using Counters for Counters.Counter;
+    Counters.Counter private _tokenIdCounter;
+    
+    uint256 public constant PANEL_PRICE = 15000; // Price per panel
+    uint256 public constant MAX_PANELS = 50; // Total number of panels
+    uint256 public constant TOTAL_NFTS = 7500; // Total number of NFTs
+    
+    uint256 public commissionMint = 5; // 5% commission for minting NFT
+    uint256 public commissionExchange = 2; // 2% commission for NFT exchange
+
+    address payable public projectOwner;
+
+    // New variables for escrow
+    address public escrow;
+    uint256 public totalSalesValue;
+    uint256 public monthlyPayment;
+
+    mapping(uint256 => uint256) public earnings; // earnings per NFT
+    mapping(uint256 => bool) public productionStatus; // production status per NFT
+    
+    bool public isPaused; 
+
+    modifier whenNotPaused() {
+        require(!isPaused, "Contract is paused");
+        _;
+    }
+
+    modifier whenPaused() {
+        require(isPaused, "Contract is not paused");
+        _;
+    }
+
+    constructor(address payable _projectOwner) ERC721("SolarPanelNFT", "SPNFT") {
+        projectOwner = _projectOwner;
+        escrow = address(this); // Initialize escrow to this contract's address
+    }
+
+    function setEscrow(address _escrow) external onlyOwner {
+        escrow = _escrow;
+    }
+
+    function setMonthlyPayment(uint256 _payment) external onlyOwner {
+        monthlyPayment = _payment;
+    }
+
+    function transferToEscrow() external onlyOwner {
+        require(monthlyPayment > 0, "Monthly payment not set");
+        require(totalSalesValue >= monthlyPayment, "Insufficient balance for payment");
+        
+        totalSalesValue -= monthlyPayment;
+        payable(escrow).transfer(monthlyPayment);
+    }
+
+    function mintNFT(uint256 numberOfPanels) external payable nonReentrant {
+        require(_tokenIdCounter.current() + numberOfPanels <= TOTAL_NFTS, "Maximum NFTs reached");
+        require(numberOfPanels > 0 && numberOfPanels <= MAX_PANELS, "Invalid number of panels");
+        uint256 totalCost = numberOfPanels * PANEL_PRICE;
+        require(msg.value >= totalCost, "Insufficient funds");
+        
+        totalSalesValue += totalCost; // Add to total sales value
+        
+        for (uint256 i = 0; i < numberOfPanels; i++) {
+            uint256 tokenId = _tokenIdCounter.current();
+            _mint(msg.sender, tokenId);
+            _tokenIdCounter.increment();
+            productionStatus[tokenId] = false; // Initialize production status
+        }
+        
+        // Calculate and transfer commission for minting
+        uint256 mintCommission = (totalCost * commissionMint) / 100;
+        projectOwner.transfer(mintCommission);
+    }
+
+    function buyNFT(uint256 tokenId) external payable nonReentrant {
+        require(ownerOf(tokenId) != address(0), "NFT does not exist");
+        require(msg.sender != ownerOf(tokenId), "You cannot buy your own NFT");
+        uint256 nftPrice = (PANEL_PRICE * 100) / TOTAL_NFTS; // Price per NFT
+        uint256 totalPrice = (nftPrice * (tokenId + 1)); // Calculate the price based on NFT ID
+        require(msg.value >= totalPrice, "Insufficient funds");
+
+        address payable ownerAddress = payable(ownerOf(tokenId)); // Change to payable
+        // Transfer ownership of NFT
+        _transfer(ownerAddress, msg.sender, tokenId);
+
+        // Calculate and transfer commission for NFT exchange
+        uint256 exchangeCommission = (totalPrice * commissionExchange) / 100;
+        projectOwner.transfer(exchangeCommission);
+        ownerAddress.transfer(totalPrice - exchangeCommission);
+    }
+
+    // Function to allow the owner of an NFT to access its metadata
+    function viewMetadata(uint256 tokenId) external view {
+        require(ownerOf(tokenId) == msg.sender, "Only the NFT owner can view metadata");
+        // Implement your logic to view NFT metadata here
+    }
+
+    // Function to facilitate the swap of NFTs with fixed and variable payments
+    function swapNFTWithPayment(uint256 tokenIdToReceive, uint256 fixedPayment, uint256 variablePayment) external nonReentrant whenNotPaused {
+        require(ownerOf(tokenIdToReceive) == msg.sender, "You can only swap an NFT you own");
+        require(ownerOf(tokenIdToReceive) != address(0), "NFT does not exist");
+        require(fixedPayment > 0 && variablePayment >= 0, "Invalid payment amounts");
+
+        address payable recipient = payable(ownerOf(tokenIdToReceive));
+
+        // Transfer the fixed payment to the owner of the NFT
+       // require(msg.value >= fixedPayment, "Insufficient fixed payment");
+        recipient.transfer(fixedPayment);
+
+        // Calculate and transfer variable payment, if any
+        if (variablePayment > 0) {
+            require(totalSalesValue >= variablePayment, "Insufficient balance for variable payment");
+
+            totalSalesValue -= variablePayment;
+            payable(escrow).transfer(variablePayment);
+        }
+
+        // Transfer ownership of the NFT
+        _transfer(recipient, msg.sender, tokenIdToReceive);
+
+        // Calculate and transfer commission for NFT exchange
+        uint256 exchangeCommission = (fixedPayment * commissionExchange) / 100;
+        projectOwner.transfer(exchangeCommission);
+        recipient.transfer(fixedPayment - exchangeCommission);
+    }
+
+    // Function to set earnings for an NFT
+    function setEarnings(uint256 tokenId, uint256 amount) external onlyOwner {
+        require(tokenId < TOTAL_NFTS, "Invalid NFT ID");
+        earnings[tokenId] = amount;
+    }
+
+    // Function to pause the contract
+    function pauseContract() external onlyOwner {
+        isPaused = true;
+    }
+
+    // Function to unpause the contract
+    function unpauseContract() external onlyOwner {
+        isPaused = false;
+    }
+
+    // Function to check if the contract is paused
+    function isContractPaused() external view returns (bool) {
+        return isPaused;
+    }
+
+    // Function to withdraw contract balance to the owner
+    function withdrawBalance() external onlyOwner {
+        uint256 contractBalance = address(this).balance;
+        require(contractBalance > 0, "Contract balance is zero");
+        payable(owner()).transfer(contractBalance);
+    }
+}
+
+pragma solidity ^0.8.0;
+
+ contract Escrow {
+    address public owner;
+    mapping(uint256 => address) public nftOwners;
+    mapping(uint256 => bool) public ownershipProven;
+    
+    constructor() {
+        owner = msg.sender;
+    }
+    
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner can call this function");
+        _;
+    }
+    
+    function proveOwnership(uint256 tokenId) external {
+        require(nftOwners[tokenId] == msg.sender, "You are not the owner of this NFT");
+        ownershipProven[tokenId] = true;
+    }
+    
+    function claimPayment(uint256 tokenId) external onlyOwner {
+        require(ownershipProven[tokenId], "Ownership not proven");
+        // Distribute payment to NFT owner
+       payable(nftOwners[tokenId]).transfer((1 ether * 7500) / 7500); // 1/7500th of the payment
+
+    }
+
+}
